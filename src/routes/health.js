@@ -22,6 +22,7 @@ router.get('/', async (req, res) => {
       sent: await Email.countDocuments({ status: 'sent' }),
       ignored: await Email.countDocuments({ status: 'ignored' }),
       archived: await Email.countDocuments({ status: 'archived' }),
+      failed: await Email.countDocuments({ status: 'failed' }),
     };
   }
 

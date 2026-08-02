@@ -1,29 +1,61 @@
 import Draft from '../models/Draft.js';
 import Email from '../models/Email.js';
 import Conversation from '../models/Conversation.js';
-import { parseWhatsAppCommand } from '../services/whatsapp/commands.js';
+import { parseWhatsAppCommand, buildDraftInstruction } from '../services/whatsapp/commands.js';
 import { generateDraft } from '../services/ai/draft.js';
-import { sendEmail } from '../services/email/smtp.js';
 import {
   sendWhatsAppText,
+  sendWhatsAppForEmail,
   formatDraft,
+  formatSentConfirmation,
+  formatPendingList,
 } from '../services/whatsapp/notify.js';
 import {
-  getPendingEmailForReply,
-  getLatestPendingDraft,
-  buildThreadText,
+  resolveEmailFromThreadContext,
+  getDraftForEmail,
+  getQuotedLinkType,
+} from '../services/whatsapp/threadLink.js';
+import {
+  buildReplyContext,
   setConversationState,
 } from '../services/conversation.js';
+import { sendApprovedDraft, cancelPendingDraft } from '../services/draftActions.js';
 import { logger } from '../services/logging.js';
 import env from '../config/env.js';
 import { WHATSAPP_COMMANDS } from '../config/constants.js';
 
+const NO_THREAD_MSG =
+  'Reply directly to the Falcon email notification for that thread (swipe-to-reply on that message). Type STATUS to see open threads.';
+
+async function requireThreadEmail(quotedMessageId, quotedText) {
+  const emailDoc = await resolveEmailFromThreadContext({ quotedMessageId, quotedText });
+  if (!emailDoc) {
+    await sendWhatsAppText(env.WHATSAPP.RECIPIENT, NO_THREAD_MSG);
+    return null;
+  }
+  if (!['notified', 'awaiting_approval'].includes(emailDoc.status)) {
+    await sendWhatsAppText(
+      env.WHATSAPP.RECIPIENT,
+      `That email thread is already marked "${emailDoc.status}". No action taken.`,
+    );
+    return null;
+  }
+  logger.info('thread.resolved', `Reply scoped to email ${emailDoc._id}`, {
+    subject: emailDoc.subject,
+    quotedMessageId,
+  });
+  return emailDoc;
+}
+
 async function createDraftForEmail(emailDoc, instruction) {
-  const thread = await buildThreadText(emailDoc.conversationId);
+  const draftInstruction = buildDraftInstruction(emailDoc, instruction);
+  const thread = buildReplyContext(emailDoc);
   const generated = await generateDraft({
-    instruction,
+    instruction: draftInstruction,
     thread,
     senderName: env.SENDER_NAME,
+    originalSubject: emailDoc.subject,
+    replyQuestion: emailDoc.replyQuestion,
   });
 
   let draft = await Draft.findOne({
@@ -35,7 +67,7 @@ async function createDraftForEmail(emailDoc, instruction) {
     draft.subject = generated.subject;
     draft.body = generated.body;
     draft.signature = env.SIGNATURE;
-    draft.instructions = instruction;
+    draft.instructions = draftInstruction;
     draft.status = 'generated';
     await draft.save();
   } else {
@@ -45,7 +77,7 @@ async function createDraftForEmail(emailDoc, instruction) {
       subject: generated.subject,
       body: generated.body,
       signature: env.SIGNATURE,
-      instructions: instruction,
+      instructions: draftInstruction,
       status: 'generated',
       attachments: emailDoc.attachments || [],
     });
@@ -63,143 +95,161 @@ async function createDraftForEmail(emailDoc, instruction) {
   return draft;
 }
 
-async function handleDraft(instruction) {
-  const emailDoc = await getPendingEmailForReply();
-  if (!emailDoc) {
-    await sendWhatsAppText(
-      env.WHATSAPP.RECIPIENT,
-      'No pending email to reply to. Falcon is idle.',
-    );
-    return { status: 'no_pending_email' };
-  }
+async function handleDraft(instruction, threadContext) {
+  const emailDoc = await requireThreadEmail(
+    threadContext.quotedMessageId,
+    threadContext.quotedText,
+  );
+  if (!emailDoc) return { status: 'no_thread' };
 
   const draft = await createDraftForEmail(emailDoc, instruction);
 
-  await sendWhatsAppText(env.WHATSAPP.RECIPIENT, formatDraft(draft));
+  await sendWhatsAppForEmail(
+    env.WHATSAPP.RECIPIENT,
+    formatDraft(draft, emailDoc),
+    { emailId: emailDoc._id, draftId: draft._id, type: 'draft' },
+  );
   logger.info('draft.generated', 'Draft sent to WhatsApp for approval', {
     draftId: draft._id,
     emailId: emailDoc._id,
   });
-  return { status: 'draft_generated', draftId: draft._id };
+  return { status: 'draft_generated', draftId: draft._id, emailId: emailDoc._id };
 }
 
-async function sendDraftToEmail(draft) {
-  const emailDoc = await Email.findById(draft.emailId);
-  if (!emailDoc || !emailDoc.from?.address) {
-    await sendWhatsAppText(
-      env.WHATSAPP.RECIPIENT,
-      'Cannot send: the original sender address is missing.',
-    );
-    return { status: 'missing_sender', emailDoc: null };
-  }
-
-  const signature = draft.signature || env.SIGNATURE || env.SENDER_NAME;
-  const fullBody = draft.body ? `${draft.body}\n\n${signature}`.trim() : signature;
-
-  const info = await sendEmail({
-    to: emailDoc.from.address,
-    subject: draft.subject,
-    text: fullBody,
-    attachments: draft.attachments || [],
-    inReplyTo: emailDoc.messageId,
-    references: emailDoc.messageId,
-  });
-
-  draft.status = 'sent';
-  draft.sentAt = new Date();
-  await draft.save();
-
-  emailDoc.status = 'sent';
-  await emailDoc.save();
-  await setConversationState(draft.conversationId, 'sent');
-
-  await sendWhatsAppText(
-    env.WHATSAPP.RECIPIENT,
-    `Email sent to ${emailDoc.from.address}\nSubject: ${draft.subject}`,
+async function handleSend(instruction, threadContext) {
+  const emailDoc = await requireThreadEmail(
+    threadContext.quotedMessageId,
+    threadContext.quotedText,
   );
+  if (!emailDoc) return { status: 'no_thread' };
 
-  logger.info('email.sent', `Reply sent to ${emailDoc.from.address}`, {
-    draftId: draft._id,
-    smtpMessageId: info.messageId,
-  });
-  return { status: 'sent', draftId: draft._id, emailDoc };
-}
-
-async function handleSend(instruction) {
-  if (instruction) {
-    const emailDoc = await getPendingEmailForReply();
-    if (!emailDoc) {
+  // Bare SEND → approve and send the existing draft for this thread.
+  if (instruction === undefined) {
+    const draft = await getDraftForEmail(emailDoc);
+    if (!draft) {
       await sendWhatsAppText(
         env.WHATSAPP.RECIPIENT,
-        'No pending email to reply to. Falcon is idle.',
+        'No draft for this thread. Swipe-reply with your answer or use /send <message>.',
       );
-      return { status: 'no_pending_email' };
+      return { status: 'no_pending_draft' };
     }
 
-    const draft = await createDraftForEmail(emailDoc, instruction);
-    await sendWhatsAppText(env.WHATSAPP.RECIPIENT, formatDraft(draft));
-    logger.info('draft.generated', 'Draft generated from /send for approval', {
-      draftId: draft._id,
-      emailId: emailDoc._id,
-    });
-    return { status: 'draft_generated', draftId: draft._id };
+    try {
+      const result = await sendApprovedDraft(draft, { notifyWhatsApp: false });
+      await sendWhatsAppForEmail(
+        env.WHATSAPP.RECIPIENT,
+        formatSentConfirmation({ draft, emailDoc: result.emailDoc }),
+        { emailId: emailDoc._id, type: 'sent_confirmation' },
+      );
+      return result;
+    } catch (err) {
+      await sendWhatsAppText(env.WHATSAPP.RECIPIENT, `Cannot send: ${err.message}`);
+      return { status: 'send_failed', error: err.message };
+    }
   }
 
-  const draft = await getLatestPendingDraft();
-  if (!draft) {
-    await sendWhatsAppText(
+  const resolvedInstruction = buildDraftInstruction(emailDoc, instruction);
+
+  await sendWhatsAppForEmail(
       env.WHATSAPP.RECIPIENT,
-      'No draft awaiting approval to send.',
+      'Drafting and sending your reply...',
+      { emailId: emailDoc._id, type: 'status' },
     );
-    return { status: 'no_pending_draft' };
-  }
 
-  return sendDraftToEmail(draft);
+    const draft = await createDraftForEmail(emailDoc, resolvedInstruction);
+
+    try {
+      const result = await sendApprovedDraft(draft, { notifyWhatsApp: false });
+      await sendWhatsAppForEmail(
+        env.WHATSAPP.RECIPIENT,
+        formatSentConfirmation({ draft, emailDoc: result.emailDoc }),
+        { emailId: emailDoc._id, type: 'sent_confirmation' },
+      );
+      logger.info('draft.sent_via_slash', 'Draft generated and sent', {
+        draftId: draft._id,
+        emailId: emailDoc._id,
+      });
+      return { status: 'sent', draftId: draft._id, smtpMessageId: result.smtpMessageId };
+    } catch (err) {
+      await sendWhatsAppForEmail(
+        env.WHATSAPP.RECIPIENT,
+        formatDraft(draft, emailDoc),
+        { emailId: emailDoc._id, draftId: draft._id, type: 'draft' },
+      );
+      await sendWhatsAppText(
+        env.WHATSAPP.RECIPIENT,
+        `Send failed: ${err.message}. Swipe-reply SEND on the draft to retry.`,
+      );
+      logger.error('draft.send_failed', err.message, { draftId: draft._id });
+      return { status: 'send_failed', error: err.message, draftId: draft._id };
+    }
 }
 
-async function handleCancel() {
-  const draft = await getLatestPendingDraft();
+async function handleCancel(threadContext) {
+  const emailDoc = await requireThreadEmail(
+    threadContext.quotedMessageId,
+    threadContext.quotedText,
+  );
+  if (!emailDoc) return { status: 'no_thread' };
+
+  const draft = await getDraftForEmail(emailDoc);
   if (!draft) {
     await sendWhatsAppText(
       env.WHATSAPP.RECIPIENT,
-      'No draft awaiting approval to cancel.',
+      'No draft awaiting approval for this thread.',
     );
     return { status: 'no_pending_draft' };
   }
 
-  draft.status = 'cancelled';
-  await draft.save();
+  return cancelPendingDraft(draft);
+}
 
-  const emailDoc = await Email.findById(draft.emailId);
-  if (emailDoc && emailDoc.status === 'awaiting_approval') {
-    emailDoc.status = 'notified';
-    await emailDoc.save();
-  }
-  await setConversationState(draft.conversationId, 'cancelled');
+async function handleStatus() {
+  const pending = await Email.find({
+    status: { $in: ['notified', 'awaiting_approval'] },
+  })
+    .sort({ date: -1 })
+    .limit(10)
+    .lean();
 
-  await sendWhatsAppText(
-    env.WHATSAPP.RECIPIENT,
-    'Draft discarded. No email was sent.',
-  );
-
-  logger.info('draft.cancelled', 'Draft cancelled', { draftId: draft._id });
-  return { status: 'cancelled', draftId: draft._id };
+  await sendWhatsAppText(env.WHATSAPP.RECIPIENT, formatPendingList(pending));
+  return { status: 'status_sent', count: pending.length };
 }
 
 export async function handleWhatsAppMessage(job) {
-  const { from, text } = job.data;
-  const command = parseWhatsAppCommand(text);
+  const { from, text, quotedMessageId, quotedText } = job.data;
+  const quotedType = await getQuotedLinkType(quotedMessageId, quotedText);
+  const command = parseWhatsAppCommand(text, { quotedType, quotedText });
+  const threadContext = { quotedMessageId, quotedText };
 
-  logger.info('whatsapp.received', `Command ${command.type} from ${from}`, { text });
+  logger.info('whatsapp.received', `Command ${command.type} from ${from}`, {
+    text,
+    quotedMessageId,
+    quotedType,
+  });
 
-  switch (command.type) {
-    case WHATSAPP_COMMANDS.SEND:
-      return handleSend(command.instruction);
-    case WHATSAPP_COMMANDS.CANCEL:
-      return handleCancel();
-    case WHATSAPP_COMMANDS.EDIT:
-      return handleDraft(command.instruction || 'Compose a professional reply.');
-    default:
-      return handleDraft(command.instruction);
+  try {
+    switch (command.type) {
+      case WHATSAPP_COMMANDS.STATUS:
+        return handleStatus();
+      case WHATSAPP_COMMANDS.SEND:
+        return handleSend(command.instruction, threadContext);
+      case WHATSAPP_COMMANDS.CANCEL:
+        return handleCancel(threadContext);
+      case WHATSAPP_COMMANDS.EDIT:
+        return handleDraft(
+          command.instruction || 'Compose a professional reply.',
+          threadContext,
+        );
+      default:
+        return handleDraft(command.instruction, threadContext);
+    }
+  } catch (err) {
+    logger.error('whatsapp.handler_failed', err.message, { from, command: command.type });
+    await sendWhatsAppText(
+      env.WHATSAPP.RECIPIENT,
+      `Something went wrong: ${err.message}. Please try again.`,
+    ).catch(() => {});
+    throw err;
   }
 }

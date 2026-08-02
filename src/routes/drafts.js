@@ -1,11 +1,7 @@
 import { Router } from 'express';
 import Draft from '../models/Draft.js';
-import Email from '../models/Email.js';
-import { sendEmail } from '../services/email/smtp.js';
-import { setConversationState } from '../services/conversation.js';
-import { sendWhatsAppText } from '../services/whatsapp/notify.js';
+import { sendApprovedDraft, cancelPendingDraft } from '../services/draftActions.js';
 import { logger } from '../services/logging.js';
-import env from '../config/env.js';
 
 const router = Router();
 
@@ -35,43 +31,16 @@ router.post('/:id/send', async (req, res, next) => {
   try {
     const draft = await Draft.findById(req.params.id);
     if (!draft) return res.status(404).json({ error: 'Draft not found' });
-    if (!['generated', 'approved'].includes(draft.status)) {
-      return res.status(400).json({ error: `Draft cannot be sent from status ${draft.status}` });
-    }
 
-    const emailDoc = await Email.findById(draft.emailId);
-    if (!emailDoc || !emailDoc.from?.address) {
-      return res.status(400).json({ error: 'Original sender address is missing' });
-    }
-
-    const signature = draft.signature || env.SIGNATURE || env.SENDER_NAME;
-    const fullBody = draft.body ? `${draft.body}\n\n${signature}`.trim() : signature;
-
-    const info = await sendEmail({
-      to: emailDoc.from.address,
-      subject: draft.subject,
-      text: fullBody,
-      attachments: draft.attachments || [],
-      inReplyTo: emailDoc.messageId,
-      references: emailDoc.messageId,
+    const result = await sendApprovedDraft(draft);
+    logger.info('api.draft_sent', `Draft ${draft._id} sent via API`, {
+      smtpMessageId: result.smtpMessageId,
     });
-
-    draft.status = 'sent';
-    draft.sentAt = new Date();
-    await draft.save();
-
-    emailDoc.status = 'sent';
-    await emailDoc.save();
-    await setConversationState(draft.conversationId, 'sent');
-
-    await sendWhatsAppText(
-      env.WHATSAPP.RECIPIENT,
-      `Email sent to ${emailDoc.from.address}\nSubject: ${draft.subject}`,
-    ).catch(() => {});
-
-    logger.info('api.draft_sent', `Draft ${draft._id} sent via API`, { smtpMessageId: info.messageId });
-    res.json({ ok: true, draftId: draft._id, smtpMessageId: info.messageId });
+    res.json({ ok: true, draftId: result.draftId, smtpMessageId: result.smtpMessageId });
   } catch (err) {
+    if (err.message.includes('cannot be sent') || err.message.includes('missing')) {
+      return res.status(400).json({ error: err.message });
+    }
     next(err);
   }
 });
@@ -81,17 +50,8 @@ router.post('/:id/cancel', async (req, res, next) => {
     const draft = await Draft.findById(req.params.id);
     if (!draft) return res.status(404).json({ error: 'Draft not found' });
 
-    draft.status = 'cancelled';
-    await draft.save();
-
-    const emailDoc = await Email.findById(draft.emailId);
-    if (emailDoc && emailDoc.status === 'awaiting_approval') {
-      emailDoc.status = 'notified';
-      await emailDoc.save();
-    }
-    await setConversationState(draft.conversationId, 'cancelled');
-
-    res.json({ ok: true, draftId: draft._id });
+    const result = await cancelPendingDraft(draft, { notifyWhatsApp: false });
+    res.json({ ok: true, draftId: result.draftId });
   } catch (err) {
     next(err);
   }

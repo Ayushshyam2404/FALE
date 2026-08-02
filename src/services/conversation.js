@@ -32,9 +32,10 @@ export async function resolveConversation(emailDoc) {
 }
 
 export async function getPendingEmailForReply() {
-  return Email.findOne({
-    status: { $in: ['notified', 'awaiting_approval'] },
-  }).sort({ date: -1 });
+  // Deprecated for WhatsApp commands — use resolveEmailFromThreadContext instead.
+  const awaiting = await Email.findOne({ status: 'awaiting_approval' }).sort({ updatedAt: -1 });
+  if (awaiting) return awaiting;
+  return Email.findOne({ status: 'notified' }).sort({ date: -1 });
 }
 
 export async function getLatestPendingDraft() {
@@ -48,6 +49,25 @@ export async function setConversationState(conversationId, state) {
   await Conversation.updateOne({ _id: conversationId }, { $set: { state } });
 }
 
+export function buildReplyContext(emailDoc) {
+  const from = emailDoc.from?.name
+    ? `${emailDoc.from.name} <${emailDoc.from.address}>`
+    : (emailDoc.from?.address || 'unknown');
+  const to = (emailDoc.recipients || [])
+    .filter((r) => r.type === 'to')
+    .map((r) => r.address)
+    .join(', ');
+  return [
+    `From: ${from}`,
+    `To: ${to || 'unknown'}`,
+    `Subject: ${emailDoc.subject || ''}`,
+    `Date: ${emailDoc.date ? emailDoc.date.toISOString() : ''}`,
+    '',
+    emailDoc.bodyText || '',
+  ].join('\n');
+}
+
+/** @deprecated Use buildReplyContext for WhatsApp replies — avoids blending separate messages. */
 export async function buildThreadText(conversationId) {
   const emails = await Email.find({ conversationId }).sort({ date: 1 }).limit(10);
 

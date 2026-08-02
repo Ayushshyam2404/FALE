@@ -49,6 +49,8 @@ const emailSchema = new Schema(
     importance: { type: Boolean, default: false },
     summary: { type: String, default: '' },
     suggestedAction: { type: String, default: '' },
+    replyQuestion: { type: String, default: '' },
+    whatsappNotificationId: { type: String, default: null, index: true },
 
     status: {
       type: String,

@@ -43,8 +43,22 @@ function cleanId(id) {
   return (id || '').replace(/[<>]/g, '').trim();
 }
 
+function asArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') return [value];
+  if (typeof value[Symbol.iterator] === 'function') {
+    try {
+      return [...value];
+    } catch {
+      return [value];
+    }
+  }
+  return [value];
+}
+
 function resolveThreadId(parsed) {
-  const references = [].concat(parsed.references || []).filter(Boolean).map(cleanId);
+  const references = asArray(parsed.references).filter(Boolean).map(cleanId);
   if (references.length > 0) return references[0];
   const inReplyTo = cleanId(parsed.inReplyTo);
   if (inReplyTo) return inReplyTo;

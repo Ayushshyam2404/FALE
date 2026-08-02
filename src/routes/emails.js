@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import Email from '../models/Email.js';
-import { sendWhatsAppText, formatEmailNotification } from '../services/whatsapp/notify.js';
+import { sendWhatsAppForEmail, formatEmailNotification } from '../services/whatsapp/notify.js';
 import { logger } from '../services/logging.js';
 import env from '../config/env.js';
 
@@ -39,7 +39,11 @@ router.post('/:id/notify', async (req, res, next) => {
   try {
     const doc = await Email.findById(req.params.id);
     if (!doc) return res.status(404).json({ error: 'Email not found' });
-    await sendWhatsAppText(env.WHATSAPP.RECIPIENT, formatEmailNotification(doc));
+    await sendWhatsAppForEmail(
+      env.WHATSAPP.RECIPIENT,
+      formatEmailNotification(doc),
+      { emailId: doc._id, type: 'notification' },
+    );
     logger.info('api.email_notified', `Re-notified email ${doc._id}`);
     res.json({ ok: true, notified: doc._id });
   } catch (err) {

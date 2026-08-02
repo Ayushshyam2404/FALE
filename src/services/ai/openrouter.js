@@ -9,7 +9,7 @@ function sleep(ms) {
 }
 
 function isRetryable(err) {
-  return /(empty content|ECONN|aborted|timeout|fetch failed)/i.test(err.message);
+  return /(empty content|ECONN|aborted|timeout|fetch failed|JSON|json)/i.test(err.message);
 }
 
 async function request(payload, attempt = 0) {
@@ -78,12 +78,33 @@ export async function chatCompletion({ system, user, temperature = 0.2, maxToken
   return content;
 }
 
+function repairJson(jsonStr) {
+  return jsonStr
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/([{,]\s*)'([^']+)'(\s*:)/g, '$1"$2"$3')
+    .replace(/:\s*'([^']*)'/g, ': "$1"');
+}
+
 export function extractJson(text) {
   const cleaned = String(text).replace(/```json/gi, '').replace(/```/g, '').trim();
+
+  try {
+    const direct = JSON.parse(cleaned);
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  } catch {
+    // fall through to brace extraction
+  }
+
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start === -1 || end === -1 || end < start) {
     throw new Error('No JSON object found in AI response');
   }
-  return JSON.parse(cleaned.slice(start, end + 1));
+
+  const slice = cleaned.slice(start, end + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    return JSON.parse(repairJson(slice));
+  }
 }

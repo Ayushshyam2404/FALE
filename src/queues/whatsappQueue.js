@@ -12,8 +12,8 @@ export const whatsappQueue = new Queue(QUEUE_NAMES.WHATSAPP, {
   },
 });
 
-export async function enqueueWhatsAppMessage({ from, text }) {
-  return whatsappQueue.add(JOB_NAMES.HANDLE_MESSAGE, { from, text });
+export async function enqueueWhatsAppMessage({ from, text, quotedMessageId, quotedText }) {
+  return whatsappQueue.add(JOB_NAMES.HANDLE_MESSAGE, { from, text, quotedMessageId, quotedText });
 }
 
 export async function closeWhatsAppQueue() {

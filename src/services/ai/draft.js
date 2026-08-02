@@ -1,4 +1,5 @@
 import { chatCompletion, extractJson } from './openrouter.js';
+import { replySubject } from '../../utils/emailSubject.js';
 import { logger } from '../logging.js';
 
 const SYSTEM_PROMPT = `You are Falcon AI, an executive email assistant. You write professional email replies.
@@ -6,6 +7,8 @@ const SYSTEM_PROMPT = `You are Falcon AI, an executive email assistant. You writ
 The email must be a complete, natural email of 3 to 6 sentences, no matter what.
 
 Strict rules:
+- Reply ONLY to the single email message provided below. Do not mention or answer topics from other emails.
+- If the email asks one question, answer only that question. Do not combine answers to older or unrelated questions.
 - Preserve all facts exactly. Never invent facts, names, dates, prices, or services.
 - Never modify dates, names, or prices.
 - Never promise services that are not available.
@@ -19,25 +22,33 @@ Respond with a single valid JSON object containing exactly two keys:
 
 Never include text outside the JSON object.`;
 
-export async function generateDraft({ instruction, thread, senderName }) {
+export async function generateDraft({ instruction, thread, senderName, originalSubject, replyQuestion }) {
   const user = [
     'Executive instruction:',
     String(instruction || 'Compose a professional, concise reply.').trim(),
     '',
-    'Email thread (oldest first):',
+    replyQuestion ? `Question to answer (ONLY this): ${replyQuestion}` : '',
+    replyQuestion ? '' : null,
+    'Email to reply to (answer ONLY this message — ignore any other context):',
     '------------------------------',
     String(thread || '').slice(0, 12000),
     '------------------------------',
     '',
     `Sender of the reply: ${senderName || 'Falcon AI'}`,
-  ].join('\n');
+  ].filter((line) => line !== null).join('\n');
 
   const content = await chatCompletion({ system: SYSTEM_PROMPT, user, maxTokens: 1200 });
   const raw = extractJson(content);
 
-  const subject = String(raw.subject || '').trim();
+  let subject = String(raw.subject || '').trim();
   const body = String(raw.body || '').trim();
-  if (!subject || !body) {
+  if (!body) {
+    throw new Error('AI draft generation returned incomplete output');
+  }
+  if (!subject && originalSubject) {
+    subject = replySubject(originalSubject);
+  }
+  if (!subject) {
     throw new Error('AI draft generation returned incomplete output');
   }
 

@@ -71,4 +71,5 @@ export const WHATSAPP_COMMANDS = {
   SEND: 'SEND',
   EDIT: 'EDIT',
   CANCEL: 'CANCEL',
+  STATUS: 'STATUS',
 };

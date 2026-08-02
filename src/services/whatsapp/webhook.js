@@ -42,7 +42,11 @@ export async function handleInboundWebhook(body = {}) {
         const text = (message.text?.body || '').trim();
         if (!text) continue;
 
-        await enqueueWhatsAppMessage({ from: message.from, text });
+        await enqueueWhatsAppMessage({
+          from: message.from,
+          text,
+          quotedMessageId: message.context?.id || null,
+        });
         handled += 1;
       }
     }
